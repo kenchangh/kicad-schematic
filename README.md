@@ -1,17 +1,17 @@
-# kicad-schematic-agent
+# kicad-schematic
 
 An agent skill for generating, validating, and fixing KiCad 8 schematic files (`.kicad_sch`) programmatically. Eliminates the #1 source of broken schematics: guessed pin positions.
 
 ## Install
 
 ```bash
-npx skills add kicad-schematic-agent
+npx skills add kicad-schematic
 ```
 
 Or from GitHub directly:
 
 ```bash
-npx skills add guanhao3797/kicad-schematic-agent
+npx skills add kenchangh/kicad-schematic
 ```
 
 ## What it does
@@ -33,7 +33,7 @@ This skill teaches your AI coding agent to:
 ## Skill contents
 
 ```
-kicad-schematic-agent/
+kicad-schematic/
 ├── SKILL.md                              # Skill instructions (agent reads this)
 ├── scripts/
 │   └── kicad_sch_helpers.py              # Python helper library

@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
 """
-KiCad Schematic Helper Library — v2 (battle-tested)
+KiCad Schematic Helper Library — v3 (battle-tested, KiCad 8 + 9)
 
 Provides reliable, computed coordinate transforms and S-expression generation
-for KiCad 8 .kicad_sch files. Eliminates the #1 source of ERC errors:
-misaligned labels/wires due to guessed pin positions.
+for KiCad 8/9 .kicad_sch files. Also provides utilities for fixing ERC errors
+on existing schematics and handling KiCad 8→9 migration.
+
+TWO MODES OF OPERATION:
+  A. Generating new schematics: SchematicBuilder, SymbolLibrary, pin_abs, snap
+  B. Fixing existing schematics: find_block, remove_by_uuid, replace_lib_id,
+     fix_annotation_suffixes, create_pwr_flag_block, etc.
 
 LESSONS LEARNED from real-world debugging:
 1. NEVER guess pin positions — always compute from symbol definitions
@@ -14,9 +19,16 @@ LESSONS LEARNED from real-world debugging:
 5. PWR_FLAG needed on every power output net (voltage regulator outputs)
 6. SOT-23-5 LDOs: VOUT is at (7.62, 2.54), NC is at (7.62, -2.54) — don't mix them up!
 7. Every pin must be either: wired+labeled, connected to power, or have no_connect flag
+8. Don't replace embedded Device:C/R/L with KiCad 9 versions (pin positions changed)
+9. kicad-cli JSON goes to file (-o flag), not stdout — never pipe to python
+10. CLI ERC doesn't check annotations — KiCad 9 GUI requires refs ending in digits
 
-Usage:
+Usage (generating):
     from kicad_sch_helpers import SchematicBuilder, SymbolLibrary, snap, pin_abs
+
+Usage (fixing):
+    from kicad_sch_helpers import (find_block, remove_by_uuid, replace_lib_id,
+        replace_footprint, fix_annotation_suffixes, create_pwr_flag_block, run_erc)
 
 The key insight: KiCad symbol libraries use Y-up (math convention),
 but .kicad_sch files use Y-down (screen convention). When placing a
@@ -715,23 +727,42 @@ def place_2pin_horizontal(builder: SchematicBuilder, lib_id: str, ref: str,
 # =============================================================================
 
 def run_erc(schematic_path: str, output_path: str = None,
-            kicad_cli: str = "kicad-cli") -> dict:
+            kicad_cli: str = "kicad-cli",
+            env_vars: dict = None) -> dict:
     """
     Run KiCad ERC check via kicad-cli and return structured results.
+
+    Args:
+        schematic_path: Path to the .kicad_sch file
+        output_path: Where to write JSON results (default: alongside schematic)
+        kicad_cli: Path to kicad-cli executable
+        env_vars: Extra environment variables (e.g., KICAD9_SYMBOL_DIR,
+                  KICAD9_FOOTPRINT_DIR for macOS KiCad 9)
 
     Returns:
         dict with: success (bool), errors (int), warnings (int),
                    error_types (dict), details (list)
+
+    Note: JSON output uses sheets[].violations[] format, not top-level violations.
+          This function handles both formats automatically.
     """
+    import os as _os
+
     if output_path is None:
         output_path = str(Path(schematic_path).with_suffix('.erc.json'))
+
+    # Build environment with optional extra vars (needed for macOS KiCad 9)
+    run_env = _os.environ.copy()
+    if env_vars:
+        run_env.update(env_vars)
 
     try:
         result = subprocess.run(
             [kicad_cli, "sch", "erc",
              "--output", output_path, "--format", "json",
              "--severity-all", schematic_path],
-            capture_output=True, text=True, timeout=60
+            capture_output=True, text=True, timeout=60,
+            env=run_env
         )
     except FileNotFoundError:
         # Try to auto-discover kicad-cli
@@ -745,7 +776,8 @@ def run_erc(schematic_path: str, output_path: str = None,
                     [found, "sch", "erc",
                      "--output", output_path, "--format", "json",
                      "--severity-all", schematic_path],
-                    capture_output=True, text=True, timeout=60
+                    capture_output=True, text=True, timeout=60,
+                    env=run_env
                 )
             except Exception as e:
                 return {"success": False, "errors": -1, "warnings": -1,
@@ -765,14 +797,22 @@ def run_erc(schematic_path: str, output_path: str = None,
     except (json.JSONDecodeError, FileNotFoundError):
         return _parse_text_erc(result.stdout + result.stderr)
 
-    errors = [v for v in report.get("violations", []) if v.get("severity") == "error"]
-    warnings = [v for v in report.get("violations", []) if v.get("severity") == "warning"]
+    # Handle both KiCad 8 (top-level violations) and KiCad 9 (sheets[].violations[])
+    all_violations = []
+    if "violations" in report:
+        all_violations = report["violations"]
+    elif "sheets" in report:
+        for sheet in report["sheets"]:
+            all_violations.extend(sheet.get("violations", []))
+
+    errors = [v for v in all_violations if v.get("severity") == "error"]
+    warnings = [v for v in all_violations if v.get("severity") == "warning"]
 
     return {
         "success": len(errors) == 0,
         "errors": len(errors), "warnings": len(warnings),
         "total": len(errors) + len(warnings),
-        "details": report.get("violations", []),
+        "details": all_violations,
         "error_types": _categorize(errors),
         "warning_types": _categorize(warnings),
     }
@@ -847,6 +887,7 @@ def find_kicad_cli() -> Optional[str]:
     if system == "Darwin":
         candidates = [
             "/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
+            "/Applications/KiCad 9.0/KiCad.app/Contents/MacOS/kicad-cli",
             "/Applications/KiCad 8.0/KiCad.app/Contents/MacOS/kicad-cli",
             Path.home() / "Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli",
         ]
@@ -859,6 +900,7 @@ def find_kicad_cli() -> Optional[str]:
         ]
     elif system == "Windows":
         candidates = [
+            Path(r"C:\Program Files\KiCad\9.0\bin\kicad-cli.exe"),
             Path(r"C:\Program Files\KiCad\8.0\bin\kicad-cli.exe"),
             Path(r"C:\Program Files\KiCad\bin\kicad-cli.exe"),
             Path(r"C:\Program Files (x86)\KiCad\8.0\bin\kicad-cli.exe"),
@@ -909,16 +951,435 @@ def suggest_kicad_cli_symlink() -> Optional[str]:
     return found
 
 
+# =============================================================================
+# ERC fixing utilities — for modifying existing schematics
+# =============================================================================
+
+def find_block(content: str, start_pos: int) -> tuple:
+    """
+    Find a balanced parenthesized block starting at start_pos.
+
+    Handles quoted strings correctly (parentheses inside quotes are ignored).
+
+    Args:
+        content: The full file content
+        start_pos: Position of the opening '('
+
+    Returns:
+        (block_text, end_pos) where end_pos is the position after the closing ')'
+
+    Raises:
+        ValueError: If no '(' at start_pos or parentheses are unbalanced
+
+    Example:
+        >>> content = '(symbol "Device:R" (pin passive line))'
+        >>> text, end = find_block(content, 0)
+        >>> text
+        '(symbol "Device:R" (pin passive line))'
+    """
+    if content[start_pos] != '(':
+        raise ValueError(f"Expected '(' at position {start_pos}, got '{content[start_pos]}'")
+    depth = 0
+    i = start_pos
+    in_string = False
+    while i < len(content):
+        c = content[i]
+        if c == '"' and (i == 0 or content[i-1] != '\\'):
+            in_string = not in_string
+        elif not in_string:
+            if c == '(':
+                depth += 1
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    return content[start_pos:i+1], i + 1
+        i += 1
+    raise ValueError(f"Unbalanced parentheses starting at {start_pos}")
+
+
+def remove_block_with_whitespace(content: str, block_start: int, block_end: int) -> str:
+    """
+    Remove a block and its surrounding whitespace/newlines cleanly.
+
+    Looks backwards for preceding whitespace/tabs and a newline,
+    and forward for trailing whitespace and a newline. Removes all of it
+    so no blank lines are left behind.
+
+    Args:
+        content: The full file content
+        block_start: Start position of the block (the opening paren)
+        block_end: End position of the block (after the closing paren)
+
+    Returns:
+        Modified content with the block and surrounding whitespace removed
+    """
+    start = block_start
+    while start > 0 and content[start-1] in ' \t':
+        start -= 1
+    if start > 0 and content[start-1] == '\n':
+        start -= 1
+    end = block_end
+    while end < len(content) and content[end] in ' \t':
+        end += 1
+    if end < len(content) and content[end] == '\n':
+        end += 1
+    return content[:start] + content[end:]
+
+
+def extract_embedded_symbol(content: str, symbol_name: str) -> Optional[str]:
+    """
+    Extract an embedded lib_symbol block by its full name.
+
+    Searches the lib_symbols section of a .kicad_sch file for a symbol
+    with the given name (e.g., 'Connector:Conn_01x04' or 'CubeSat_SDR:AMS1117')
+    and returns the complete s-expression block.
+
+    Args:
+        content: The full .kicad_sch file content
+        symbol_name: Full prefixed symbol name (e.g., 'CubeSat_SDR:AMS1117')
+
+    Returns:
+        The symbol block text, or None if not found
+    """
+    pattern = f'(symbol "{symbol_name}"'
+    pos = content.find(pattern)
+    if pos == -1:
+        return None
+    block_text, _ = find_block(content, pos)
+    return block_text
+
+
+def convert_embedded_to_library(block_text: str, old_prefix: str, new_name: str) -> str:
+    """
+    Convert an embedded lib_symbol to standalone library format.
+
+    In embedded format: top-level is (symbol "Prefix:Name" ...)
+    In library format: top-level is (symbol "Name" ...)
+    Sub-symbols (Name_0_1, Name_1_1) remain unchanged in both formats.
+
+    Args:
+        block_text: The extracted symbol block
+        old_prefix: The library prefix to remove (e.g., "Connector", "CubeSat_SDR")
+        new_name: The symbol name without prefix (e.g., "Conn_01x04")
+
+    Returns:
+        The converted block suitable for a .kicad_sym library file
+    """
+    return block_text.replace(
+        f'(symbol "{old_prefix}:{new_name}"',
+        f'(symbol "{new_name}"',
+        1
+    )
+
+
+def find_by_uuid(content: str, uuid: str) -> Optional[int]:
+    """
+    Find the position of a UUID string in the content.
+
+    Args:
+        content: The full file content
+        uuid: The UUID to search for
+
+    Returns:
+        Position of the UUID marker, or None if not found
+    """
+    marker = f'(uuid "{uuid}")'
+    pos = content.find(marker)
+    return pos if pos != -1 else None
+
+
+def remove_by_uuid(content: str, uuid: str, element_type: str) -> str:
+    """
+    Remove an element (symbol, wire, no_connect, label) by its UUID.
+
+    Searches backwards from the UUID to find the containing block of the
+    specified type, then removes it with surrounding whitespace.
+
+    Args:
+        content: The full file content
+        uuid: The UUID of the element to remove
+        element_type: The s-expression type ('symbol', 'wire', 'no_connect', 'label')
+
+    Returns:
+        Modified content with the element removed
+
+    Raises:
+        ValueError: If UUID not found or parent block not found
+
+    Example:
+        >>> content = remove_by_uuid(content, "ac2d9711-...", "symbol")
+    """
+    marker = f'(uuid "{uuid}")'
+    pos = content.find(marker)
+    if pos == -1:
+        raise ValueError(f"UUID '{uuid}' not found in content")
+
+    # Search backwards for the containing element
+    search_term = f'({element_type}'
+    block_start = content.rfind(search_term, 0, pos)
+    if block_start == -1:
+        raise ValueError(f"Could not find parent ({element_type} block for UUID '{uuid}'")
+
+    block_text, block_end = find_block(content, block_start)
+    if uuid not in block_text:
+        raise ValueError(f"Found ({element_type} block but UUID '{uuid}' not inside it")
+
+    return remove_block_with_whitespace(content, block_start, block_end)
+
+
+def replace_lib_id(content: str, old_id: str, new_id: str) -> tuple:
+    """
+    Replace a lib_id across all symbol instances and embedded lib_symbols.
+
+    Updates both:
+    - (lib_id "old_id") in placed symbol instances
+    - (symbol "old_id" ...) in the embedded lib_symbols section
+
+    Args:
+        content: The full .kicad_sch file content
+        old_id: The old lib_id (e.g., "Connector:Conn_01x04")
+        new_id: The new lib_id (e.g., "CubeSat_SDR:Conn_01x04")
+
+    Returns:
+        (modified_content, count) where count is total replacements made
+
+    Example:
+        >>> content, n = replace_lib_id(content, "Connector:SMA", "CubeSat_SDR:SMA")
+        >>> print(f"Replaced {n} occurrences")
+    """
+    count = 0
+
+    # Replace in placed symbol instances
+    old_str = f'(lib_id "{old_id}")'
+    new_str = f'(lib_id "{new_id}")'
+    c = content.count(old_str)
+    content = content.replace(old_str, new_str)
+    count += c
+
+    # Replace in embedded lib_symbol key
+    old_sym = f'(symbol "{old_id}"'
+    new_sym = f'(symbol "{new_id}"'
+    if old_sym in content:
+        content = content.replace(old_sym, new_sym)
+        count += 1
+
+    return content, count
+
+
+def replace_footprint(content: str, old_fp: str, new_fp: str) -> tuple:
+    """
+    Replace a footprint reference across all symbol instances.
+
+    Args:
+        content: The full .kicad_sch file content
+        old_fp: The old footprint (e.g., "Button_Switch_SMD:SW_Push_1P1T_NO_6x3.5mm")
+        new_fp: The new footprint (e.g., "Button_Switch_SMD:SW_Push_1P1T_NO_CK_PTS125Sx43SMTR")
+
+    Returns:
+        (modified_content, count) where count is number of replacements
+
+    Example:
+        >>> content, n = replace_footprint(content,
+        ...     "Connector_Coaxial:SMA_Amphenol_901-143_Vertical",
+        ...     "Connector_Coaxial:SMA_Amphenol_901-144_Vertical")
+    """
+    old_str = f'"Footprint" "{old_fp}"'
+    new_str = f'"Footprint" "{new_fp}"'
+    count = content.count(old_str)
+    content = content.replace(old_str, new_str)
+    return content, count
+
+
+def fix_annotation_suffixes(content: str) -> tuple:
+    """
+    Ensure all reference designators end with a digit (KiCad 9 requirement).
+
+    KiCad 9's GUI requires all references to end with a number. References
+    like 'C_RX1B_N' or 'J_PWR' cause "Item not annotated" errors. This
+    function appends '1' to any reference that doesn't end with a digit.
+
+    Handles both:
+    - (property "Reference" "C_RX1B_N" ...) in symbol properties
+    - (reference "C_RX1B_N") in instance paths
+
+    Args:
+        content: The full .kicad_sch file content
+
+    Returns:
+        (modified_content, fixed_refs) where fixed_refs is list of refs that were fixed
+
+    Example:
+        >>> content, refs = fix_annotation_suffixes(content)
+        >>> print(f"Fixed {len(refs)} references: {refs}")
+    """
+    # Find all instance references (excluding hidden #FLG, #PWR)
+    refs = re.findall(r'\(reference "([^"]+)"\)', content)
+    visible_refs = [r for r in refs if not r.startswith('#')]
+    no_digit = sorted(set(r for r in visible_refs if r and not r[-1].isdigit()))
+
+    for ref in no_digit:
+        new_ref = ref + "1"
+        # Replace in property "Reference"
+        old_prop = f'"Reference" "{ref}"'
+        new_prop = f'"Reference" "{new_ref}"'
+        content = content.replace(old_prop, new_prop)
+
+        # Replace in instance (reference ...)
+        old_inst = f'(reference "{ref}")'
+        new_inst = f'(reference "{new_ref}")'
+        content = content.replace(old_inst, new_inst)
+
+    return content, no_digit
+
+
+def create_pwr_flag_block(x: float, y: float, ref_num: int,
+                          project_name: str, root_uuid: str) -> str:
+    """
+    Generate a PWR_FLAG symbol s-expression block for insertion into a schematic.
+
+    Use this to fix 'power_pin_not_driven' ERC errors. Place the PWR_FLAG
+    on a wire connected to the power input pin.
+
+    Args:
+        x, y: Position in schematic coordinates (should be on a wire)
+        ref_num: Reference number (e.g., 7 for #FLG07)
+        project_name: Project name for the instances section
+        root_uuid: Root sheet UUID for the instances path
+
+    Returns:
+        Complete s-expression block ready to insert into the schematic
+
+    Example:
+        >>> block = create_pwr_flag_block(34.29, 77.47, 7, "cubesat_sdr",
+        ...     "5fb33c66-7637-43ae-9eef-34b4f23f6cfb")
+    """
+    sym_uuid = uid()
+    pin_uuid = uid()
+    ref = f"#FLG{ref_num:02d}"
+
+    return f"""\t(symbol
+\t\t(lib_id "power:PWR_FLAG")
+\t\t(at {x} {y} 0)
+\t\t(unit 1)
+\t\t(exclude_from_sim no)
+\t\t(in_bom yes)
+\t\t(on_board yes)
+\t\t(dnp no)
+\t\t(uuid "{sym_uuid}")
+\t\t(property "Reference" "{ref}"
+\t\t\t(at {x} {y - 2.54} 0)
+\t\t\t(effects
+\t\t\t\t(font
+\t\t\t\t\t(size 1.27 1.27)
+\t\t\t\t)
+\t\t\t\t(hide yes)
+\t\t\t)
+\t\t)
+\t\t(property "Value" "PWR_FLAG"
+\t\t\t(at {x} {y - 3.81} 0)
+\t\t\t(effects
+\t\t\t\t(font
+\t\t\t\t\t(size 0.8 0.8)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t\t(property "Footprint" ""
+\t\t\t(at {x} {y} 0)
+\t\t\t(effects
+\t\t\t\t(font
+\t\t\t\t\t(size 1.27 1.27)
+\t\t\t\t)
+\t\t\t\t(hide yes)
+\t\t\t)
+\t\t)
+\t\t(property "Datasheet" ""
+\t\t\t(at {x} {y} 0)
+\t\t\t(effects
+\t\t\t\t(font
+\t\t\t\t\t(size 1.27 1.27)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t\t(property "Description" ""
+\t\t\t(at {x} {y} 0)
+\t\t\t(effects
+\t\t\t\t(font
+\t\t\t\t\t(size 1.27 1.27)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t\t(pin "1"
+\t\t\t(uuid "{pin_uuid}")
+\t\t)
+\t\t(instances
+\t\t\t(project "{project_name}"
+\t\t\t\t(path "/{root_uuid}"
+\t\t\t\t\t(reference "{ref}")
+\t\t\t\t\t(unit 1)
+\t\t\t\t)
+\t\t\t)
+\t\t)
+\t)"""
+
+
+def suppress_erc_warning(pro_path: str, rule_name: str) -> None:
+    """
+    Suppress an ERC warning type in the .kicad_pro file.
+
+    Only use for warnings that are known-safe (e.g., lib_symbol_mismatch
+    during KiCad 8→9 migration). Never suppress errors.
+
+    Args:
+        pro_path: Path to the .kicad_pro file
+        rule_name: The rule to suppress (e.g., 'lib_symbol_mismatch')
+    """
+    with open(pro_path) as f:
+        pro = json.load(f)
+
+    if 'erc' not in pro:
+        pro['erc'] = {}
+    if 'rule_severities' not in pro['erc']:
+        pro['erc']['rule_severities'] = {}
+
+    pro['erc']['rule_severities'][rule_name] = 'ignore'
+
+    with open(pro_path, 'w') as f:
+        json.dump(pro, f, indent=2)
+        f.write('\n')
+
+
 if __name__ == "__main__":
-    print("KiCad Schematic Helper Library v2")
+    print("KiCad Schematic Helper Library v3")
     print(f"Grid: {GRID} mm")
+    print()
+
+    # Test coordinate utilities
+    print("=== Coordinate Utilities ===")
     print(f"snap(42.5) = {snap(42.5)}")
     print(f"pin_abs(320, 200, -17.78, 25.40, rotation=0) = "
           f"{pin_abs(320, 200, -17.78, 25.40, rotation=0)}")
     print(f"pin_abs(320, 200, 0, 2.54, rotation=90) = "
           f"{pin_abs(320, 200, 0, 2.54, rotation=90)}")
     print()
-    print("Checking kicad-cli availability...")
+
+    # Test ERC fixing utilities
+    print("=== ERC Fixing Utilities ===")
+    test_content = '(symbol (lib_id "test") (at 0 0 0) (uuid "abc-123"))'
+    block, end = find_block(test_content, 0)
+    print(f"find_block: found block of {len(block)} chars, end at {end}")
+
+    test_sch = 'before\n\t(wire (pts (xy 0 0) (xy 1 1))\n\t\t(uuid "wire-1")\n\t)\nafter'
+    cleaned = remove_block_with_whitespace(test_sch, 8, test_sch.index(')') + 1)
+    print(f"remove_block_with_whitespace: '{test_sch[:20]}...' -> '{cleaned[:20]}...'")
+
+    # Test annotation suffix fixing
+    test_refs = '(reference "C_RX1B_N")(reference "R1")(reference "J_PWR")'
+    fixed, refs = fix_annotation_suffixes(test_refs)
+    print(f"fix_annotation_suffixes: fixed {len(refs)} refs: {refs}")
+    print()
+
+    # Check kicad-cli
+    print("=== kicad-cli ===")
     cli_path = find_kicad_cli()
     if cli_path:
         print(f"kicad-cli found: {cli_path}")

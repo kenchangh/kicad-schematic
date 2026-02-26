@@ -1,4 +1,4 @@
-# KiCad 8 Schematic S-Expression Format Reference
+# KiCad 8/9 Schematic S-Expression Format Reference
 
 ## File Structure
 
@@ -283,9 +283,13 @@ assert depth == 0, f"Parenthesis imbalance: depth={depth}"
 | power_pin_not_driven | error | Power input with no power source | Add PWR_FLAG on the net |
 | pin_not_driven | error | Input pin with no output driver | Connect to output or add pull-up/pull-down |
 | endpoint_off_grid | warning | Wire/pin not on 1.27mm grid | Snap all coordinates with `snap()` |
-| lib_symbol_mismatch | warning | Embedded symbol differs from library | Re-copy symbol from library into lib_symbols |
-| lib_symbol_issues | warning | Symbol not found or malformed | Ensure symbol exists in lib_symbols with correct sub-symbol naming |
+| lib_symbol_mismatch | warning | Embedded symbol differs from library | Re-copy symbol from library OR suppress in .kicad_pro (safe for KiCad 8→9 migration) |
+| lib_symbol_issues | warning | Symbol not found in referenced library | Create project-level custom library with the symbol; update lib_id to point there |
 | unconnected_wire_endpoint | warning | Wire end not connected to anything | Extend wire to pin/label or remove dangling wire |
+| no_connect_connected | warning | No-connect flag on a pin that IS connected | Remove the no_connect flag (the pin has a real connection) |
+| multiple_net_names | warning | Two labels on same net create dual names | Intentional: suppress in .kicad_pro. Accidental: remove one label |
+| footprint_link_issues | warning | Footprint not found in library | Update footprint name to KiCad 9 equivalent using `replace_footprint()` |
+| unannotated | error (GUI) | Reference doesn't end with digit | Use `fix_annotation_suffixes()` — note: CLI ERC doesn't catch this |
 
 ### Error Priority (Fix in This Order)
 
@@ -311,7 +315,131 @@ A wire connects two points only if both endpoints exactly match pin/label positi
 
 ### ERC Report Parsing
 ```bash
-kicad-cli sch erc --output report.json --format json schematic.kicad_sch
+kicad-cli sch erc --output report.json --format json --severity-all schematic.kicad_sch
 ```
 
+**Always use `--severity-all`** to include warnings (default only shows errors).
+
+**Always use `-o file.json`** — kicad-cli writes JSON to the output file, NOT to stdout. Piping to python gives empty stdin.
+
 The JSON output contains `severity`, `type`, and position information for each error. Group errors by type to identify systematic issues (e.g., all label_dangling errors suggesting a coordinate transform bug).
+
+**KiCad 9 JSON format** nests violations under `sheets[].violations[]`:
+```json
+{
+  "sheets": [
+    {
+      "path": "/",
+      "uuid_path": "/root-uuid",
+      "violations": [
+        {
+          "description": "Input Power pin not driven...",
+          "severity": "error",
+          "type": "power_pin_not_driven",
+          "items": [...]
+        }
+      ]
+    }
+  ]
+}
+```
+
+This differs from KiCad 8 which uses top-level `violations[]`. The helper `run_erc()` handles both formats.
+
+---
+
+## KiCad 9 Differences
+
+### Symbol Renames
+
+Symbols renamed or removed between KiCad 8 and 9:
+
+| KiCad 8 | KiCad 9 | Notes |
+|---|---|---|
+| `Connector:Conn_01x04` | `Connector:Conn_01x04_Pin` | All Conn_01xNN renamed |
+| `Connector:Conn_01x06` | `Connector:Conn_01x06_Pin` | Same pattern |
+| `Connector:Conn_02x20` | `Connector:Conn_02x20_Pin` | All Conn_02xNN renamed |
+| `Connector:SMA` | Removed | No direct replacement |
+| `Connector:TestPoint` | `Connector:TestPoint` | May have moved/changed |
+| `Regulator_Linear:AMS1117` | Has 4 pins (ADJ added) | 3-pin schematic breaks |
+
+### Pin Position Changes
+
+**CRITICAL — Do NOT update these symbols:**
+
+| Symbol | KiCad 8 Pins | KiCad 9 Pins | Impact |
+|---|---|---|---|
+| `Device:C` | (0, ±2.54) | (0, ±3.81) | Breaks every capacitor connection |
+| `Device:R` | (0, ±2.54) | (0, ±3.81) | Breaks every resistor connection |
+| `Device:L` | (0, ±2.54) | (0, ±3.81) | Breaks every inductor connection |
+
+The embedded symbols in the schematic work correctly because they contain the original pin positions. Suppress `lib_symbol_mismatch` instead of updating.
+
+### Footprint Renames
+
+| KiCad 8 | KiCad 9 |
+|---|---|
+| `Button_Switch_SMD:SW_Push_1P1T_NO_6x3.5mm` | `Button_Switch_SMD:SW_Push_1P1T_NO_CK_PTS125Sx43SMTR` |
+| `Connector_Coaxial:SMA_Amphenol_901-143_Vertical` | `Connector_Coaxial:SMA_Amphenol_901-144_Vertical` |
+
+### Annotation Requirements
+
+KiCad 9 requires all reference designators to end with a digit. This is enforced by the GUI but NOT by CLI ERC.
+
+Affected references (examples): `C_RX1B_N`, `C_TX2A_P`, `J_PWR`, `R_BIAS`
+
+Fix: append `1` to each bare reference in both property and instance sections.
+
+---
+
+## Environment Variables for kicad-cli
+
+On macOS, `kicad-cli` may not find the global symbol/footprint libraries without these:
+
+```bash
+export KICAD9_SYMBOL_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols"
+export KICAD9_FOOTPRINT_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints"
+```
+
+Without these, ERC will report false `lib_symbol_issues` warnings for every symbol from global libraries.
+
+Full ERC command:
+```bash
+KICAD9_SYMBOL_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols" \
+KICAD9_FOOTPRINT_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints" \
+/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli sch erc \
+  --format json --severity-all -o /tmp/erc_result.json schematic.kicad_sch
+```
+
+---
+
+## Project Library Tables
+
+When standard KiCad libraries change between versions, use project-level library tables to add custom symbol/footprint libraries.
+
+### sym-lib-table (symbol library table)
+
+Place in project root directory:
+```
+(sym_lib_table
+  (version 7)
+  (lib (name "CubeSat_SDR")(type "KiCad")(uri "${KIPRJMOD}/libraries/cubesat_sdr.kicad_sym")(options "")(descr "Project custom symbols"))
+)
+```
+
+### fp-lib-table (footprint library table)
+
+Place in project root directory:
+```
+(fp_lib_table
+  (version 7)
+  (lib (name "CubeSat_SDR")(type "KiCad")(uri "${KIPRJMOD}/libraries/cubesat_sdr.pretty")(options "")(descr "Project custom footprints"))
+)
+```
+
+### Key Notes
+
+- `${KIPRJMOD}` resolves to the project directory — use it for portable paths
+- Project-level tables supplement (don't replace) global library tables
+- Library names must match the prefix used in `lib_id` references (e.g., `CubeSat_SDR:AMS1117` needs a library named `CubeSat_SDR`)
+- `.kicad_sym` files use the same s-expression format as embedded `lib_symbols`, but top-level symbols omit the library prefix

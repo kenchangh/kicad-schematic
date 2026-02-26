@@ -1,11 +1,11 @@
 ---
 name: kicad-schematic
-description: "Generate, validate, and fix KiCad 8 schematic files (.kicad_sch) programmatically. Use this skill whenever the user wants to create or modify KiCad schematics, generate netlists from circuit descriptions, or fix ERC errors. Triggers on: KiCad, schematic, .kicad_sch, ERC, electrical rules check, circuit design, PCB schematic, netlist generation, S-expression schematic."
+description: "Generate, validate, and fix KiCad 8/9 schematic files (.kicad_sch) programmatically. Use this skill whenever the user wants to create, modify, or fix KiCad schematics, generate netlists from circuit descriptions, fix ERC errors, or migrate schematics between KiCad versions. Triggers on: KiCad, schematic, .kicad_sch, ERC, electrical rules check, circuit design, PCB schematic, netlist generation, S-expression schematic, KiCad migration."
 ---
 
 # KiCad Schematic Agent
 
-Generate ERC-clean KiCad 8 schematics by writing Python scripts that use computed pin positions — never guess coordinates.
+Generate ERC-clean KiCad 8/9 schematics by writing Python scripts that use computed pin positions — never guess coordinates. Also fix ERC errors on existing schematics and handle KiCad 8→9 migration.
 
 ## Critical Principle
 
@@ -299,6 +299,245 @@ def my_fixer(erc_result, iteration):
 final = validate_and_fix_loop("output/schematic.kicad_sch", my_fixer)
 ```
 
+## Fixing ERC on Existing Schematics
+
+When the user has an existing `.kicad_sch` with ERC errors (not generating a new schematic), use this workflow.
+
+### Step 1: Run ERC with JSON Output
+
+**Always** use `--format json -o file.json --severity-all`. Never pipe kicad-cli output to stdout — it writes JSON to the file specified by `-o`.
+
+On macOS, kicad-cli needs environment variables to find the standard libraries:
+
+```bash
+KICAD9_SYMBOL_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols" \
+KICAD9_FOOTPRINT_DIR="/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints" \
+/Applications/KiCad/KiCad.app/Contents/MacOS/kicad-cli sch erc \
+  --format json --severity-all -o /tmp/erc_result.json schematic.kicad_sch
+```
+
+Or use the helper:
+```python
+from kicad_sch_helpers import run_erc
+result = run_erc("schematic.kicad_sch", env_vars={
+    "KICAD9_SYMBOL_DIR": "/Applications/KiCad/KiCad.app/Contents/SharedSupport/symbols",
+    "KICAD9_FOOTPRINT_DIR": "/Applications/KiCad/KiCad.app/Contents/SharedSupport/footprints",
+})
+```
+
+### Step 2: Parse and Categorize Violations
+
+```python
+import json
+with open("/tmp/erc_result.json") as f:
+    report = json.load(f)
+
+violations = []
+for sheet in report.get("sheets", []):
+    violations.extend(sheet.get("violations", []))
+
+# Categorize by severity and type
+errors = [v for v in violations if v.get("severity") == "error"]
+warnings = [v for v in violations if v.get("severity") == "warning"]
+by_type = {}
+for v in violations:
+    t = v.get("type", "unknown")
+    by_type.setdefault(t, []).append(v)
+
+print(f"Errors: {len(errors)}, Warnings: {len(warnings)}")
+for t, items in sorted(by_type.items()):
+    print(f"  {t}: {len(items)}")
+```
+
+**Note:** The JSON format nests violations under `sheets[].violations[]`, not at the top level.
+
+### Step 3: Write Targeted Python Fix Scripts
+
+**Never manually edit `.kicad_sch` files** — always write Python scripts. The s-expression format is sensitive to whitespace and parenthesis balance.
+
+Key utility functions (all in `scripts/kicad_sch_helpers.py`):
+
+```python
+from kicad_sch_helpers import (
+    find_block,                    # Find balanced parenthesized block
+    remove_block_with_whitespace,  # Clean removal preserving formatting
+    extract_embedded_symbol,       # Extract from lib_symbols section
+    convert_embedded_to_library,   # Embedded → standalone library format
+    find_by_uuid,                  # Locate element by UUID
+    remove_by_uuid,                # Remove element by UUID
+    replace_lib_id,                # Bulk lib_id replacement
+    replace_footprint,             # Bulk footprint replacement
+    fix_annotation_suffixes,       # Add numeric suffixes to bare refs
+    create_pwr_flag_block,         # Generate PWR_FLAG s-expression
+)
+```
+
+### Step 4: Common Fix Patterns
+
+**Remove a symbol by UUID:**
+```python
+content = remove_by_uuid(content, "uuid-string", "symbol")
+```
+
+**Replace a lib_id across all instances:**
+```python
+content = replace_lib_id(content, "Connector:Conn_01x04", "CubeSat_SDR:Conn_01x04")
+```
+
+**Add PWR_FLAG to fix power_pin_not_driven:**
+```python
+pwr_block = create_pwr_flag_block(
+    x=34.29, y=77.47, ref_num=7,
+    project_name="my_project",
+    root_uuid="5fb33c66-7637-43ae-9eef-34b4f23f6cfb"
+)
+# Insert before the final closing paren
+last_close = content.rstrip().rfind(')')
+content = content[:last_close] + '\n' + pwr_block + '\n' + content[last_close:]
+```
+
+**Suppress warnings in .kicad_pro:**
+```python
+import json
+with open("project.kicad_pro") as f:
+    pro = json.load(f)
+pro["erc"]["rule_severities"]["lib_symbol_mismatch"] = "ignore"
+with open("project.kicad_pro", "w") as f:
+    json.dump(pro, f, indent=2)
+    f.write('\n')
+```
+
+### Step 5: Iterative Fix-Verify Loop
+
+Always run ERC after each batch of fixes. Some fixes expose new issues:
+1. Run ERC → parse results → categorize
+2. Fix the highest-priority errors first (see error priority in references)
+3. Run ERC again → verify error count dropped
+4. Repeat until 0 errors (warnings may be suppressed if justified)
+
+**Back up the schematic before running fix scripts.** Use `shutil.copy2()`.
+
+---
+
+## KiCad 8→9 Migration
+
+When validating a KiCad 8 schematic with KiCad 9, expect these categories of issues:
+
+### Symbol Renames (lib_symbol_issues)
+
+| KiCad 8 Name | KiCad 9 Name | Notes |
+|---|---|---|
+| `Connector:Conn_01x04` | `Connector:Conn_01x04_Pin` | All single-row connectors renamed |
+| `Connector:Conn_01x06` | `Connector:Conn_01x06_Pin` | Same pattern |
+| `Connector:Conn_02x20` | `Connector:Conn_02x20_Pin` | All dual-row connectors too |
+| `Connector:SMA` | Removed | Use custom library or Connector:Coaxial |
+| `Connector:TestPoint` | `Connector:TestPoint` (moved) | May have different pin layout |
+| `Regulator_Linear:AMS1117` | Has 4 pins (added ADJ) | 3-pin schematic won't match |
+
+**Fix strategy:** Create a project-level custom library with KiCad 8 symbol versions. Change lib_ids to point to the custom library. Do NOT try to update to KiCad 9 versions — pin positions differ and will break wire connections.
+
+### Pin Position Changes (lib_symbol_mismatch)
+
+**CRITICAL: Do NOT replace embedded Device:C/R/L symbols with KiCad 9 versions.**
+
+KiCad 9 changed passive pin positions:
+- KiCad 8: `Device:C` pins at (0, ±2.54)
+- KiCad 9: `Device:C` pins at (0, ±3.81)
+
+Replacing embedded symbols breaks every wire connected to every capacitor, resistor, and inductor. Instead, suppress `lib_symbol_mismatch` in `.kicad_pro` — the embedded KiCad 8 symbols work fine.
+
+### Footprint Renames (footprint_link_issues)
+
+| KiCad 8 Footprint | KiCad 9 Footprint |
+|---|---|
+| `SW_Push_1P1T_NO_6x3.5mm` | `SW_Push_1P1T_NO_CK_PTS125Sx43SMTR` |
+| `SMA_Amphenol_901-143_Vertical` | `SMA_Amphenol_901-144_Vertical` |
+
+Use `replace_footprint()` for bulk updates.
+
+### Annotation Requirements
+
+**KiCad 9 requires all reference designators to end with a digit.** References like `C_RX1B_N` or `J_PWR` will cause "Item not annotated" errors in the GUI (but NOT in CLI ERC).
+
+```python
+from kicad_sch_helpers import fix_annotation_suffixes
+content = fix_annotation_suffixes(content)  # Adds "1" suffix to bare refs
+```
+
+### Migration Workflow
+
+1. Run ERC → categorize violations
+2. Create custom library with KiCad 8 symbol versions (extract from embedded `lib_symbols`)
+3. Update lib_ids from standard libraries to custom library
+4. Update renamed footprints
+5. Fix annotation suffixes
+6. Add PWR_FLAG for any new power_pin_not_driven errors
+7. Suppress `lib_symbol_mismatch` in `.kicad_pro` (safe — embedded symbols still work)
+8. Suppress `multiple_net_names` if intentional dual-naming exists
+9. Run ERC again → verify 0 errors
+
+---
+
+## Custom Library Management
+
+When standard KiCad libraries change between versions, create project-level libraries to preserve compatibility.
+
+### Creating Project Library Tables
+
+**`sym-lib-table`** (in project root):
+```
+(sym_lib_table
+  (version 7)
+  (lib (name "CubeSat_SDR")(type "KiCad")(uri "${KIPRJMOD}/libraries/cubesat_sdr.kicad_sym")(options "")(descr "Project custom symbols"))
+)
+```
+
+**`fp-lib-table`** (in project root):
+```
+(fp_lib_table
+  (version 7)
+  (lib (name "CubeSat_SDR")(type "KiCad")(uri "${KIPRJMOD}/libraries/cubesat_sdr.pretty")(options "")(descr "Project custom footprints"))
+)
+```
+
+Use `${KIPRJMOD}` for portable paths — it resolves to the project directory.
+
+### Extracting Embedded Symbols to Library
+
+When migrating from standard library symbols to custom ones:
+
+```python
+from kicad_sch_helpers import extract_embedded_symbol, convert_embedded_to_library
+
+# Read schematic
+with open("schematic.kicad_sch") as f:
+    sch = f.read()
+
+# Extract a symbol from the embedded lib_symbols section
+block = extract_embedded_symbol(sch, "Connector:Conn_01x04")
+
+# Convert from embedded format (prefix:Name) to library format (Name)
+lib_block = convert_embedded_to_library(block, "Connector", "Conn_01x04")
+
+# Append to custom library file (before the final closing paren)
+with open("libraries/custom.kicad_sym") as f:
+    lib = f.read()
+close_pos = lib.rstrip().rfind(')')
+lib = lib[:close_pos] + '\t' + lib_block + '\n' + lib[close_pos:]
+with open("libraries/custom.kicad_sym", "w") as f:
+    f.write(lib)
+```
+
+### Embedded vs Library Format
+
+In `.kicad_sch` embedded `lib_symbols`: top-level is `(symbol "Library:Name" ...)`, sub-symbols use `(symbol "Name_0_1" ...)`.
+
+In `.kicad_sym` library files: top-level is `(symbol "Name" ...)`, sub-symbols use `(symbol "Name_0_1" ...)`.
+
+The only difference is the top-level name loses its library prefix.
+
+---
+
 ## Common Patterns
 
 ### Decoupling Capacitor Array
@@ -387,6 +626,22 @@ These lessons came from debugging a real 119-component CubeSat SDR schematic:
    assert depth == 0, f"Parenthesis imbalance: depth={depth}"
    ```
 
+9. **Don't replace embedded Device:C/R/L with KiCad 9 versions.** KiCad 9 changed passive pin positions from ±2.54 to ±3.81. Replacing embedded symbols breaks every wire connection. Suppress `lib_symbol_mismatch` instead.
+
+10. **kicad-cli JSON goes to file, not stdout.** Always use `-o /tmp/result.json`. Piping to python gives empty stdin. The JSON is nested under `sheets[].violations[]`, not at the top level.
+
+11. **CLI ERC doesn't check annotations.** The GUI flags "Item not annotated" for references not ending with a digit (e.g., `C_RX1B_N`), but CLI ERC silently passes. Always run `fix_annotation_suffixes()` when migrating.
+
+12. **macOS kicad-cli needs environment variables.** Without `KICAD9_SYMBOL_DIR` and `KICAD9_FOOTPRINT_DIR`, kicad-cli can't find the global libraries and produces false `lib_symbol_issues` warnings.
+
+13. **Don't use `grep -P` on macOS.** PCRE mode is not supported. Use Python regex for all pattern matching on schematic files.
+
+14. **Create project-level library tables for custom symbols.** Use `${KIPRJMOD}` for portable paths. Extract embedded symbols to populate the library — don't rewrite them from scratch.
+
+15. **Back up before running fix scripts.** A broken parenthesis balance renders the schematic unloadable. Use `shutil.copy2()` before any modifications.
+
+16. **Don't suppress ERC errors, only warnings.** Suppressing `lib_symbol_mismatch` (warnings) is safe for KiCad 8→9 migration. Never suppress actual errors like `pin_not_connected` or `power_pin_not_driven`.
+
 ## Reference Files
 
 - `scripts/kicad_sch_helpers.py` — Python helper library (always use this)
@@ -396,6 +651,7 @@ Read `references/kicad_sexpression_format.md` before generating any schematic to
 
 ## Checklist Before Delivery
 
+### New Schematic Generation
 1. All coordinates snapped to 1.27mm grid via `snap()`
 2. Every IC pin either connected via `connect_pin()` / `wl()` or flagged with `connect_pin_noconnect()` / `nc()`
 3. Sub-symbol names fixed with `fix_subsymbol_names()`
@@ -404,3 +660,13 @@ Read `references/kicad_sexpression_format.md` before generating any schematic to
 6. Parenthesis balance verified (depth 0 at end of file)
 7. Pin positions verified against .kicad_sym library (not guessed)
 8. SOT-23-5 VOUT vs NC positions double-checked for all LDOs
+
+### Existing Schematic Fixing / KiCad 9 Migration
+9. All reference designators end with a digit (`fix_annotation_suffixes()`)
+10. Renamed/missing symbols handled via project-level custom library
+11. Embedded Device:C/R/L symbols NOT replaced (suppress `lib_symbol_mismatch` instead)
+12. Renamed footprints updated (`replace_footprint()`)
+13. PWR_FLAG added on all power input nets including external power (barrel jack, USB VBUS)
+14. Schematic backed up before running any fix scripts
+15. Environment variables set for kicad-cli on macOS (`KICAD9_SYMBOL_DIR`, `KICAD9_FOOTPRINT_DIR`)
+16. ERC run with `--severity-all` to catch all warning types
